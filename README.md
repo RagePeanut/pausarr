@@ -103,8 +103,8 @@ All configuration is via environment variables (see `.env.example`).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `QBITTORRENT_URL` | `http://localhost:8080` | qBittorrent Web UI base URL |
-| `QBITTORRENT_USER` | `admin` | Web UI username |
-| `QBITTORRENT_PASS` | `adminadmin` | Web UI password |
+| `QBITTORRENT_USER` | _(empty)_ | Web UI username — **optional**, see note below |
+| `QBITTORRENT_PASS` | _(empty)_ | Web UI password — **optional**, see note below |
 | `HEARTBEAT_TIMEOUT` | `180` | Seconds without a ping before a heartbeat flag expires (**global**) |
 | `POLL_INTERVAL` | `15` | Seconds between watchdog runs (expiry + reconcile) |
 | `STATE_FILE` | `/data/state.json` | Where flag state is persisted |
@@ -113,6 +113,14 @@ All configuration is via environment variables (see `.env.example`).
 > **Heartbeat clients should ping well within `HEARTBEAT_TIMEOUT`.** With the
 > default 180 s window, ping every 60 s. That tolerates two missed pings before
 > a false resume.
+
+> **qBittorrent credentials are optional.** If your qBittorrent has
+> *"Bypass authentication for clients on localhost"* or a whitelisted IP subnet
+> that includes Pausarr, leave `QBITTORRENT_USER`/`QBITTORRENT_PASS` unset —
+> Pausarr will talk to the Web API without logging in. If the server ever
+> replies `403`, Pausarr will attempt to log in with whatever credentials you
+> *did* provide and retry. Set both variables only if your Web UI requires a
+> login.
 
 ---
 

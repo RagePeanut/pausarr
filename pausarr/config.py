@@ -21,7 +21,8 @@ class Config:
     behaviour is fully declarative from the docker-compose file.
     """
 
-    # qBittorrent Web UI connection
+    # qBittorrent Web UI connection. User/pass are optional: leave them unset
+    # if qBittorrent bypasses authentication for Pausarr's IP/subnet.
     qbittorrent_url: str
     qbittorrent_user: str
     qbittorrent_pass: str
@@ -44,8 +45,9 @@ class Config:
     def from_env(cls) -> "Config":
         return cls(
             qbittorrent_url=os.getenv("QBITTORRENT_URL", "http://localhost:8080"),
-            qbittorrent_user=os.getenv("QBITTORRENT_USER", "admin"),
-            qbittorrent_pass=os.getenv("QBITTORRENT_PASS", "adminadmin"),
+            # Empty by default — only needed when qBittorrent requires auth.
+            qbittorrent_user=os.getenv("QBITTORRENT_USER", ""),
+            qbittorrent_pass=os.getenv("QBITTORRENT_PASS", ""),
             heartbeat_timeout=float(os.getenv("HEARTBEAT_TIMEOUT", "180")),
             poll_interval=float(os.getenv("POLL_INTERVAL", "15")),
             state_file=os.getenv("STATE_FILE", "/data/state.json"),
