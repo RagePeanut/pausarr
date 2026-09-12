@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Runtime state / data
+data/
+*.state.json
+state.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
