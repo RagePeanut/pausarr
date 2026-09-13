@@ -81,11 +81,44 @@ is open and do nothing when it isn't; there's no need to detect "app closed".
 
 ## Quick start
 
+Build the image and run it, pointing it at your qBittorrent:
+
 ```bash
 git clone https://github.com/RagePeanut/pausarr.git
 cd pausarr
-cp .env.example .env      # edit qBittorrent URL / credentials
-docker compose up -d --build
+docker build -t pausarr .
+
+docker run -d --name pausarr \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -v "$(pwd)/data:/data" \
+  -e QBITTORRENT_URL="http://<qbittorrent-host>:8080" \
+  pausarr
+```
+
+Add `QBITTORRENT_USER` / `QBITTORRENT_PASS` only if your Web UI requires a
+login (see [Configuration](#configuration)).
+
+**Running it alongside qBittorrent in Docker?** Add `pausarr` as a service in
+your existing Compose stack so it shares the network and can reach qBittorrent
+by container name. A minimal service definition:
+
+```yaml
+  pausarr:
+    build: /path/to/pausarr        # or image: your published image
+    container_name: pausarr
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - QBITTORRENT_URL=http://qbittorrent:8080
+      # - QBITTORRENT_USER=admin      # only if the Web UI requires auth
+      # - QBITTORRENT_PASS=adminadmin
+      - HEARTBEAT_TIMEOUT=180
+      - POLL_INTERVAL=15
+      - STATE_FILE=/data/state.json
+    volumes:
+      - ./pausarr-data:/data
 ```
 
 Check it's alive and see current state:
