@@ -25,6 +25,33 @@ from .state import StateStore
 logger = logging.getLogger(__name__)
 
 
+class _HealthzAccessLogFilter(logging.Filter):
+    """Drop uvicorn access-log lines for the health-check endpoint.
+
+    The Docker HEALTHCHECK hits ``GET /healthz`` every 30s, which otherwise
+    floods the access log and drowns out real ``/pause`` and ``/heartbeat``
+    traffic. Uvicorn's access logger emits records whose ``args`` are
+    ``(client_addr, method, full_path, http_version, status_code)``; we filter
+    on the request path (index 2). The health-check itself keeps working — only
+    its log line is suppressed.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            path = args[2]
+            if isinstance(path, str) and path.split("?", 1)[0] == "/healthz":
+                return False
+        return True
+
+
+def _install_healthz_log_filter() -> None:
+    """Attach the /healthz filter to uvicorn's access logger (idempotent)."""
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _HealthzAccessLogFilter) for f in access_logger.filters):
+        access_logger.addFilter(_HealthzAccessLogFilter())
+
+
 class PauseRequest(BaseModel):
     tag: str = Field(..., min_length=1, description="Source identifier, e.g. 'plex'")
     request: Literal["pause", "resume"] = Field(
@@ -43,6 +70,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         level=getattr(logging, config.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
+    # Keep the health-check working but stop it spamming the access log.
+    _install_healthz_log_filter()
 
     store = StateStore(config.state_file, config.heartbeat_timeout)
     qbt = QBittorrentClient(
