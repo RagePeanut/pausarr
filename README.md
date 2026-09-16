@@ -83,7 +83,33 @@ is open and do nothing when it isn't; there's no need to detect "app closed".
 
 ## Quick start
 
-Build the image and run it, pointing it at your qBittorrent:
+### Option A — pull the prebuilt image from GHCR (recommended)
+
+A multi-arch image (`linux/amd64` + `linux/arm64`) is published to the GitHub
+Container Registry on every push to `main` and every version tag:
+
+```bash
+docker run -d --name pausarr \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -v "$(pwd)/data:/data" \
+  -e QBITTORRENT_URL="http://<qbittorrent-host>:8080" \
+  ghcr.io/ragepeanut/pausarr:latest
+```
+
+Available tags:
+
+| Tag | Points to |
+|-----|-----------|
+| `latest` | Newest build from `main` |
+| `1.2.3`, `1.2` | A specific released version (from a `v1.2.3` Git tag) |
+| `main` | Latest `main` build |
+| `sha-<short-sha>` | An exact commit |
+
+Pin to a version tag (e.g. `ghcr.io/ragepeanut/pausarr:1.2`) for reproducible
+deploys, or track `latest` to always get the newest build.
+
+### Option B — build it yourself
 
 ```bash
 git clone https://github.com/RagePeanut/pausarr.git
@@ -107,7 +133,7 @@ by container name. A minimal service definition:
 
 ```yaml
   pausarr:
-    build: /path/to/pausarr        # or image: your published image
+    image: ghcr.io/ragepeanut/pausarr:latest   # or `build: /path/to/pausarr`
     container_name: pausarr
     restart: unless-stopped
     ports:
@@ -353,6 +379,31 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn pausarr.app:app --reload --port 8080
 ```
+
+## Publishing (maintainers)
+
+Images are published to GHCR automatically by
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml):
+
+- **On push to `main`** → `ghcr.io/ragepeanut/pausarr:latest` (and `:main`).
+- **On a version tag** (`git tag v1.2.3 && git push --tags`) → `:1.2.3`,
+  `:1.2`, and `:latest`.
+- **Manually** from the repo's **Actions → Publish Docker image to GHCR → Run
+  workflow**.
+
+The workflow authenticates with the built-in `GITHUB_TOKEN`, so **no secrets
+need to be configured** — it just needs `packages: write` permission, which the
+workflow already requests.
+
+**One-time setup — make the package public.** By default a newly published
+GHCR package is private. To let anyone `docker pull` it without logging in:
+
+1. Go to the package page: `https://github.com/users/RagePeanut/packages/container/package/pausarr`
+   (or the repo's **Packages** sidebar entry after the first successful run).
+2. **Package settings → Danger Zone → Change visibility → Public**.
+
+Optionally, under the package's settings, link it to this repository and grant
+the repo **Write** access so future workflow runs can keep pushing.
 
 ## License
 
