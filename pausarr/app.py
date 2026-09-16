@@ -77,7 +77,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     qbt = QBittorrentClient(
         config.qbittorrent_url, config.qbittorrent_user, config.qbittorrent_pass
     )
-    reconciler = Reconciler(store, qbt, config.poll_interval)
+    reconciler = Reconciler(store, qbt, config.poll_interval, config.pause_mode)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -86,7 +86,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         store.expire_stale()
         await reconciler.reconcile()
         reconciler.start()
-        logger.info("Pausarr started")
+        logger.info("Pausarr started (pause mode: %s)", config.pause_mode)
         try:
             yield
         finally:
@@ -114,7 +114,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/status")
     async def status():
-        return store.snapshot()
+        return {"pause_mode": config.pause_mode, **store.snapshot()}
 
     @app.get("/healthz")
     async def healthz():
