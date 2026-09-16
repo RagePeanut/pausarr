@@ -19,6 +19,7 @@ import asyncio
 import logging
 from typing import Optional
 
+from .config import PAUSE_MODE_BOTH
 from .qbittorrent import QBittorrentClient, QBittorrentError
 from .state import StateStore
 
@@ -26,10 +27,20 @@ logger = logging.getLogger(__name__)
 
 
 class Reconciler:
-    def __init__(self, store: StateStore, qbt: QBittorrentClient, poll_interval: float) -> None:
+    def __init__(
+        self,
+        store: StateStore,
+        qbt: QBittorrentClient,
+        poll_interval: float,
+        pause_mode: str = PAUSE_MODE_BOTH,
+    ) -> None:
         self._store = store
         self._qbt = qbt
         self._poll_interval = poll_interval
+        # "both" | "upload" | "download". In "both" we stop/start torrents; in
+        # the directional modes we snapshot and throttle that direction's rate
+        # limit instead. See _apply_pause / _apply_resume.
+        self._pause_mode = pause_mode
         # None = unknown (force a reconcile on first run so we converge the
         # actual qBittorrent state to what Pausarr believes).
         self._last_applied_pause: Optional[bool] = None
@@ -45,13 +56,51 @@ class Reconciler:
                 return
             try:
                 if desired_pause:
-                    await self._qbt.pause_all()
+                    await self._apply_pause()
                 else:
-                    await self._qbt.resume_all()
+                    await self._apply_resume()
                 self._last_applied_pause = desired_pause
             except (QBittorrentError, Exception) as exc:  # noqa: BLE001
                 # Leave _last_applied_pause unchanged so the next poll retries.
                 logger.error("Reconcile failed (will retry): %s", exc)
+
+    async def _apply_pause(self) -> None:
+        """Pause according to the configured mode.
+
+        * ``both``     — stop all torrents.
+        * ``upload`` / ``download`` — snapshot each torrent's current
+          per-torrent limit for that direction, persist it, then throttle the
+          direction to the minimum. The snapshot is taken *before* throttling
+          so we capture the user's real limits, and only when one isn't already
+          cached (a re-pause while already paused must not overwrite the
+          originals with our throttle value).
+        """
+        if self._pause_mode == PAUSE_MODE_BOTH:
+            await self._qbt.pause_all()
+            return
+        direction = self._pause_mode
+        if not self._store.has_cached_limits(direction):
+            limits = await self._qbt.fetch_limits()
+            self._store.save_cached_limits(direction, limits[direction])
+        await self._qbt.throttle_all(direction)
+
+    async def _apply_resume(self) -> None:
+        """Resume according to the configured mode (inverse of _apply_pause)."""
+        if self._pause_mode == PAUSE_MODE_BOTH:
+            await self._qbt.resume_all()
+            return
+        direction = self._pause_mode
+        limits = self._store.take_cached_limits(direction)
+        if limits:
+            await self._qbt.restore_limits(direction, limits)
+        else:
+            # No snapshot (e.g. first run, or state lost): fall back to
+            # unlimited so we don't leave torrents stuck at the throttle floor.
+            await self._qbt.restore_limits(direction, {})
+            logger.info(
+                "No cached %s limits to restore; leaving current limits as-is",
+                direction,
+            )
 
     async def _run(self) -> None:
         logger.info("Watchdog started (poll interval %.0fs)", self._poll_interval)
