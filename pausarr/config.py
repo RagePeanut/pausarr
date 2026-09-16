@@ -6,10 +6,16 @@ import os
 from dataclasses import dataclass
 
 # Valid values for PAUSE_MODE. See Config.pause_mode.
-PAUSE_MODE_BOTH = "both"
-PAUSE_MODE_UPLOAD = "upload"
-PAUSE_MODE_DOWNLOAD = "download"
-_VALID_PAUSE_MODES = {PAUSE_MODE_BOTH, PAUSE_MODE_UPLOAD, PAUSE_MODE_DOWNLOAD}
+#
+# * "all"          — fully stop every torrent (both downloading and seeding).
+# * "keep-seeding" — stop *downloading* but keep completed torrents *seeding*.
+#                    Achieved by setting qBittorrent's global
+#                    ``max_active_downloads`` to 0 (with torrent queueing
+#                    enabled), which halts active downloads while finished
+#                    torrents continue to upload.
+PAUSE_MODE_ALL = "all"
+PAUSE_MODE_KEEP_SEEDING = "keep-seeding"
+_VALID_PAUSE_MODES = {PAUSE_MODE_ALL, PAUSE_MODE_KEEP_SEEDING}
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -24,7 +30,7 @@ def _get_pause_mode(name: str, default: str) -> str:
 
     An explicitly-set but invalid value is a configuration error and raises so
     the misconfiguration surfaces at startup rather than silently pausing the
-    wrong direction (or nothing).
+    wrong way (or nothing).
     """
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -59,19 +65,15 @@ class Config:
     # How often the watchdog re-evaluates state and expires stale heartbeats.
     poll_interval: float
 
-    # Which direction(s) to pause. One of "both" (default), "upload" or
-    # "download".
+    # What a pause does. One of "all" (default) or "keep-seeding".
     #
-    # * "both"     — fully stop/start torrents (hashes=all). Simplest, and the
-    #                historical behaviour.
-    # * "upload"   — leave downloading running but throttle *uploads* to the
-    #                minimum (1 B/s) while paused.
-    # * "download" — leave uploading (seeding) running but throttle *downloads*
-    #                to the minimum (1 B/s) while paused.
-    #
-    # In the directional modes Pausarr snapshots each torrent's original
-    # per-torrent rate limit before throttling and restores it on resume, so it
-    # never clobbers limits you set manually.
+    # * "all"          — fully stop/start every torrent (hashes=all). The
+    #                    historical behaviour: downloading and seeding both halt.
+    # * "keep-seeding" — stop downloading but keep completed torrents seeding.
+    #                    Pausarr sets qBittorrent's global
+    #                    ``max_active_downloads`` to 0 (and enables queueing if
+    #                    needed), snapshotting the originals first and restoring
+    #                    them on resume so it never clobbers your settings.
     pause_mode: str
 
     # Where the flag state is persisted so it survives restarts.
@@ -90,7 +92,7 @@ class Config:
             qbittorrent_pass=os.getenv("QBITTORRENT_PASS", ""),
             heartbeat_timeout=float(os.getenv("HEARTBEAT_TIMEOUT", "180")),
             poll_interval=float(os.getenv("POLL_INTERVAL", "15")),
-            pause_mode=_get_pause_mode("PAUSE_MODE", PAUSE_MODE_BOTH),
+            pause_mode=_get_pause_mode("PAUSE_MODE", PAUSE_MODE_ALL),
             state_file=os.getenv("STATE_FILE", "/data/state.json"),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )

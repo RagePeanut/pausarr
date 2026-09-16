@@ -1,7 +1,8 @@
 """Minimal async client for the qBittorrent Web API (v2).
 
-Only what Pausarr needs: (optionally) authenticate, then pause or resume *all*
-torrents.
+Only what Pausarr needs: (optionally) authenticate, then either pause/resume
+*all* torrents, or — for "keep-seeding" mode — stop new downloads via the
+global download-queue limit while completed torrents keep seeding.
 
 **Authentication is optional.** qBittorrent can be configured to bypass
 authentication for clients on localhost or on a whitelisted subnet
@@ -22,17 +23,13 @@ endpoint first and fall back to the legacy one on a 404/405.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
-
-# The minimum non-zero per-torrent rate limit qBittorrent accepts, in bytes/s.
-# We use this to "pause" a single direction: 0 would mean *unlimited*, so 1 B/s
-# is as close to stopped as the API allows.
-THROTTLE_FLOOR_BYTES = 1
 
 
 class QBittorrentError(RuntimeError):
@@ -130,83 +127,70 @@ class QBittorrentClient:
             resp = await self._client.get(path, params=params)
         return resp
 
-    async def fetch_limits(self) -> dict[str, dict[str, int]]:
-        """Snapshot every torrent's per-torrent upload/download rate limits.
-
-        Returns ``{"upload": {hash: bytes_per_s}, "download": {hash: ...}}`` with
-        0 meaning "no per-torrent limit" (unlimited).
-
-        Read from ``/torrents/info`` because the dedicated
-        ``/torrents/uploadLimit`` + ``/torrents/downloadLimit`` endpoints, when
-        given ``hashes=all``, return a single aggregate value (``{"all": -1}``)
-        rather than a per-hash map — useless for restoring individual limits.
-        ``/torrents/info`` exposes the true per-torrent values as ``up_limit`` /
-        ``dl_limit``.
-        """
-        resp = await self._get_with_reauth("/api/v2/torrents/info", {})
+    async def get_preferences(self) -> dict:
+        """Return qBittorrent's application preferences as a dict."""
+        resp = await self._get_with_reauth("/api/v2/app/preferences", {})
         if resp.status_code != 200:
             raise QBittorrentError(
-                f"qBittorrent /torrents/info failed "
+                f"qBittorrent /app/preferences failed "
                 f"(status {resp.status_code}): {resp.text!r}"
             )
-        upload: dict[str, int] = {}
-        download: dict[str, int] = {}
-        for torrent in resp.json():
-            hash_ = torrent.get("hash")
-            if not hash_:
-                continue
-            # up_limit/dl_limit are bytes/s; qBittorrent reports 0 (and, on some
-            # versions, -1) for "no limit". Normalise both to 0 so restore is
-            # unambiguous.
-            up = torrent.get("up_limit", 0)
-            dl = torrent.get("dl_limit", 0)
-            upload[hash_] = up if isinstance(up, int) and up > 0 else 0
-            download[hash_] = dl if isinstance(dl, int) and dl > 0 else 0
-        return {"upload": upload, "download": download}
+        return resp.json()
 
-    async def _set_limit(self, direction: str, hashes: str, limit: int) -> None:
-        """Set the per-torrent upload or download limit for ``hashes``.
+    async def _set_preferences(self, prefs: dict) -> None:
+        """Update qBittorrent preferences.
 
-        ``limit`` is bytes/s; 0 restores unlimited. ``hashes`` is a
-        pipe-separated list of hashes or the literal ``"all"``.
+        The API expects a form field ``json`` containing a JSON object of the
+        keys to change; unspecified keys are left untouched.
         """
-        path = (
-            "/api/v2/torrents/setUploadLimit"
-            if direction == "upload"
-            else "/api/v2/torrents/setDownloadLimit"
+        resp = await self._post_with_reauth(
+            "/api/v2/app/setPreferences", {"json": json.dumps(prefs)}
         )
-        resp = await self._post_with_reauth(path, {"hashes": hashes, "limit": limit})
         if resp.status_code != 200:
             raise QBittorrentError(
-                f"qBittorrent {path} failed "
+                f"qBittorrent /app/setPreferences failed "
                 f"(status {resp.status_code}): {resp.text!r}"
             )
 
-    async def throttle_all(self, direction: str) -> None:
-        """Throttle one direction for all torrents to the minimum (1 B/s)."""
-        await self._set_limit(direction, "all", THROTTLE_FLOOR_BYTES)
-        logger.info("Throttled %s for all torrents to %d B/s", direction, THROTTLE_FLOOR_BYTES)
+    async def stop_downloads(self) -> dict:
+        """Stop new/active downloads while letting completed torrents seed.
 
-    async def restore_limits(self, direction: str, limits: dict[str, int]) -> None:
-        """Restore each torrent's original per-torrent limit for a direction.
+        Sets the global ``max_active_downloads`` to 0, which — with torrent
+        queueing enabled — pauses the *downloading* phase but leaves seeding
+        untouched. Queueing is enabled if it wasn't already (otherwise the
+        limit is ignored).
 
-        ``limits`` maps hash to original bytes/s (0 = unlimited). To restore
-        differing values, torrents are grouped by their original limit and one
-        API call is issued per distinct value (the endpoint applies a single
-        ``limit`` to a batch of ``hashes``).
+        Returns the original values ``{"max_active_downloads": int,
+        "queueing_enabled": bool}`` so the caller can cache and later restore
+        them.
         """
-        if not limits:
-            return
-        by_value: dict[int, list[str]] = {}
-        for hash_, value in limits.items():
-            by_value.setdefault(value, []).append(hash_)
-        for value, hashes in by_value.items():
-            await self._set_limit(direction, "|".join(hashes), value)
+        prefs = await self.get_preferences()
+        original = {
+            "max_active_downloads": int(prefs.get("max_active_downloads", 0)),
+            "queueing_enabled": bool(prefs.get("queueing_enabled", False)),
+        }
+        await self._set_preferences(
+            {"queueing_enabled": True, "max_active_downloads": 0}
+        )
         logger.info(
-            "Restored %s limits for %d torrent(s) across %d distinct value(s)",
-            direction,
-            len(limits),
-            len(by_value),
+            "Stopped downloads (max_active_downloads=0; queueing on); "
+            "was max_active_downloads=%s, queueing_enabled=%s",
+            original["max_active_downloads"],
+            original["queueing_enabled"],
+        )
+        return original
+
+    async def restore_downloads(self, original: dict) -> None:
+        """Restore the download-queue preferences captured by stop_downloads."""
+        prefs = {
+            "queueing_enabled": bool(original.get("queueing_enabled", True)),
+            "max_active_downloads": int(original.get("max_active_downloads", 0)),
+        }
+        await self._set_preferences(prefs)
+        logger.info(
+            "Restored downloads (max_active_downloads=%s, queueing_enabled=%s)",
+            prefs["max_active_downloads"],
+            prefs["queueing_enabled"],
         )
 
     async def _toggle_all(self, modern_path: str, legacy_path: str) -> None:

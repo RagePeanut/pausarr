@@ -61,13 +61,12 @@ class StateStore:
         self._heartbeat_timeout = heartbeat_timeout
         self._lock = threading.RLock()
         self._flags: dict[str, Flag] = {}
-        # Snapshot of each torrent's original per-torrent rate limit, taken when
-        # a directional (upload/download) pause is applied and consumed when it
-        # is lifted. Keyed by direction ("upload"/"download") then torrent hash,
-        # with the limit in bytes/s (0 = unlimited). Empty when not paused in a
-        # directional mode. Persisted so a restart mid-pause can still restore
-        # the originals. See Reconciler for how it's used.
-        self._cached_limits: dict[str, dict[str, int]] = {}
+        # Snapshot of the qBittorrent download-queue preferences taken when a
+        # "keep-seeding" pause is applied and consumed when it is lifted:
+        # ``{"max_active_downloads": int, "queueing_enabled": bool}``. Empty
+        # when not paused in that mode. Persisted so a restart mid-pause can
+        # still restore the originals. See Reconciler for how it's used.
+        self._cached_prefs: dict[str, object] = {}
         self._load()
 
     # ------------------------------------------------------------------ #
@@ -88,37 +87,35 @@ class StateStore:
                     last_seen=data.get("last_seen", 0.0),
                     updated_at=data.get("updated_at", time.time()),
                 )
-            self._cached_limits = self._sanitize_cached_limits(
-                raw.get("cached_limits", {})
+            self._cached_prefs = self._sanitize_cached_prefs(
+                raw.get("cached_prefs", {})
             )
             logger.info("Loaded %d flag(s) from %s", len(self._flags), self._state_file)
         except (OSError, ValueError, KeyError) as exc:
             logger.warning("Could not load state file %s: %s; starting fresh", self._state_file, exc)
             self._flags = {}
-            self._cached_limits = {}
+            self._cached_prefs = {}
 
     @staticmethod
-    def _sanitize_cached_limits(raw: object) -> dict[str, dict[str, int]]:
-        """Coerce a loaded cached-limits blob into a well-typed structure.
+    def _sanitize_cached_prefs(raw: object) -> dict[str, object]:
+        """Coerce a loaded cached-prefs blob into a well-typed structure.
 
         Anything malformed is dropped rather than raising, so a corrupt or
         older cache never blocks startup — the worst case is we lose the
-        snapshot and restore torrents to unlimited (see Reconciler).
+        snapshot (see Reconciler for how that's handled on resume). Only a
+        complete snapshot (both keys present and well-typed) is kept.
         """
-        result: dict[str, dict[str, int]] = {}
         if not isinstance(raw, dict):
-            return result
-        for direction in ("upload", "download"):
-            entries = raw.get(direction)
-            if not isinstance(entries, dict):
-                continue
-            clean: dict[str, int] = {}
-            for hash_, limit in entries.items():
-                if isinstance(hash_, str) and isinstance(limit, int) and not isinstance(limit, bool):
-                    clean[hash_] = limit
-            if clean:
-                result[direction] = clean
-        return result
+            return {}
+        mad = raw.get("max_active_downloads")
+        qe = raw.get("queueing_enabled")
+        if (
+            isinstance(mad, int)
+            and not isinstance(mad, bool)
+            and isinstance(qe, bool)
+        ):
+            return {"max_active_downloads": mad, "queueing_enabled": qe}
+        return {}
 
     def _persist_locked(self) -> None:
         """Atomically write state to disk. Caller must hold the lock."""
@@ -132,7 +129,7 @@ class StateStore:
                 }
                 for tag, f in self._flags.items()
             },
-            "cached_limits": self._cached_limits,
+            "cached_prefs": self._cached_prefs,
         }
         directory = os.path.dirname(self._state_file) or "."
         try:
@@ -186,36 +183,33 @@ class StateStore:
                 logger.info("Flag %r cleared", tag)
             return existed
 
-    def save_cached_limits(self, direction: str, limits: dict[str, int]) -> None:
-        """Persist the pre-pause snapshot of per-torrent limits for a direction.
+    def save_cached_prefs(self, prefs: dict) -> None:
+        """Persist the pre-pause snapshot of download-queue preferences.
 
-        ``direction`` is ``"upload"`` or ``"download"``; ``limits`` maps torrent
-        hash to its original limit in bytes/s (0 = unlimited). Replaces any
-        previous snapshot for that direction.
+        ``prefs`` is ``{"max_active_downloads": int, "queueing_enabled": bool}``.
+        Replaces any previous snapshot.
         """
         with self._lock:
-            if limits:
-                self._cached_limits[direction] = dict(limits)
-            else:
-                self._cached_limits.pop(direction, None)
+            self._cached_prefs = dict(prefs) if prefs else {}
             self._persist_locked()
 
-    def take_cached_limits(self, direction: str) -> dict[str, int]:
-        """Return and clear the snapshot for a direction (empty if none).
+    def take_cached_prefs(self) -> dict:
+        """Return and clear the download-queue snapshot (empty if none).
 
-        Clearing on read makes restore idempotent: once limits are handed back
-        to the reconciler they won't be applied again on a later resume.
+        Clearing on read makes restore idempotent: once the prefs are handed
+        back to the reconciler they won't be applied again on a later resume.
         """
         with self._lock:
-            limits = self._cached_limits.pop(direction, {})
-            if limits:
+            prefs = self._cached_prefs
+            self._cached_prefs = {}
+            if prefs:
                 self._persist_locked()
-            return dict(limits)
+            return dict(prefs)
 
-    def has_cached_limits(self, direction: str) -> bool:
-        """Whether a snapshot exists for a direction (without consuming it)."""
+    def has_cached_prefs(self) -> bool:
+        """Whether a snapshot exists (without consuming it)."""
         with self._lock:
-            return bool(self._cached_limits.get(direction))
+            return bool(self._cached_prefs)
 
     def expire_stale(self, now: Optional[float] = None) -> list[str]:
         """Remove heartbeat flags whose TTL has elapsed. Returns expired tags."""
