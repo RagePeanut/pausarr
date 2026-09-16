@@ -5,8 +5,9 @@ Pause your torrents while you're actually watching something — from **any** so
 Pausarr is a tiny always-on service that sits between your media sources and
 qBittorrent. Each source raises a flag when it wants torrenting paused; Pausarr
 **pauses torrents while any flag is active and resumes them once every flag
-is clear.** By default it stops torrents outright, but it can instead pause only
-uploads or only downloads (see [Pause modes](#pause-modes)). It replaces a
+is clear.** By default it stops torrents outright, but it can instead stop only
+*downloading* while completed torrents keep *seeding* (see
+[Pause modes](#pause-modes)). It replaces a
 single-purpose Tautulli→qBittorrent script with a
 general hub that also handles YouTube/Twitch on a TV, apps on your phone, or
 anything else that can send an HTTP request.
@@ -142,7 +143,7 @@ All configuration is via environment variables (see `.env.example`).
 | `QBITTORRENT_PASS` | _(empty)_ | Web UI password — **optional**, see note below |
 | `HEARTBEAT_TIMEOUT` | `180` | Seconds without a ping before a heartbeat flag expires (**global**) |
 | `POLL_INTERVAL` | `15` | Seconds between watchdog runs (expiry + reconcile) |
-| `PAUSE_MODE` | `both` | Which direction to pause: `both`, `upload`, or `download` — see [Pause modes](#pause-modes) |
+| `PAUSE_MODE` | `all` | What a pause does: `all` or `keep-seeding` — see [Pause modes](#pause-modes) |
 | `STATE_FILE` | `/data/state.json` | Where flag state is persisted |
 | `LOG_LEVEL` | `INFO` | Python log level |
 
@@ -160,34 +161,33 @@ All configuration is via environment variables (see `.env.example`).
 
 ### Pause modes
 
-`PAUSE_MODE` controls **what** a pause does. The flag logic is identical in all
+`PAUSE_MODE` controls **what** a pause does. The flag logic is identical in both
 modes — only the action taken against qBittorrent changes.
 
 | Mode | While a flag is active | Effect |
 |------|------------------------|--------|
-| `both` *(default)* | Stops **all** torrents (`hashes=all`) | Uploads *and* downloads halt — the classic behaviour |
-| `upload` | Throttles every torrent's **upload** rate to the minimum | Downloads keep running; seeding is effectively paused |
-| `download` | Throttles every torrent's **download** rate to the minimum | Seeding keeps running; downloads are effectively paused |
+| `all` *(default)* | Stops **all** torrents (`hashes=all`) | Downloading *and* seeding halt — the classic behaviour |
+| `keep-seeding` | Sets qBittorrent's global `max_active_downloads` to **0** | New/active **downloads** stop; **completed torrents keep seeding** at full speed |
 
-**How the directional modes work.** qBittorrent has no "pause one direction"
-call, so Pausarr uses per-torrent **rate limits**. On pause it snapshots each
-torrent's current limit for that direction (read from `torrents/info`), persists
-it to the state file, then sets the limit to **1 B/s** — the lowest the API
-allows (`0` means *unlimited*). On resume it restores each torrent to its
-original limit, so any limits you set manually survive a pause/resume cycle.
-Torrents are grouped by their original value so restore takes one API call per
-distinct limit.
+**How `keep-seeding` works.** qBittorrent can't "pause downloads" per torrent
+without also killing seeding — throttling the download rate drags upload down
+too, because BitTorrent peers reciprocate (tit-for-tat). So instead of rate
+limits, Pausarr uses qBittorrent's **queueing**: on pause it snapshots the
+global `max_active_downloads` and `queueing_enabled` preferences, persists them
+to the state file, enables queueing if it wasn't already, and sets
+`max_active_downloads` to `0`. That halts the *downloading* phase while finished
+torrents continue *seeding*. On resume it restores your original values.
 
-> **Caveats for `upload`/`download`:**
-> - The throttled direction isn't fully stopped — it's capped at ~1 B/s. In
->   practice that's negligible, but it isn't literally zero.
-> - A very low **upload** cap can slightly drag down download speed too, due to
->   BitTorrent protocol overhead (peers reciprocate based on your upload). If
->   you want downloads completely unaffected, `download` mode (throttling the
->   other direction) or `both` avoids this.
-> - If Pausarr's state file is lost while paused, it can't know the originals on
->   the next resume; it then leaves the current limits untouched rather than
->   guessing. Keep `STATE_FILE` on a persistent volume.
+> **Notes for `keep-seeding`:**
+> - It's **global**, not per-category — it affects the whole qBittorrent
+>   download queue while a flag is active.
+> - A **partially-downloaded** torrent will only seed the pieces it already has
+>   (that's just how BitTorrent works); **completed** torrents seed normally.
+> - Requires qBittorrent **torrent queueing**; Pausarr enables it automatically
+>   while paused and restores your original setting on resume.
+> - If Pausarr's state file is lost while paused, it can't know your original
+>   `max_active_downloads`; it then leaves qBittorrent's current settings
+>   untouched rather than guessing. Keep `STATE_FILE` on a persistent volume.
 
 ---
 
@@ -214,7 +214,7 @@ the current status snapshot.
 
 ```json
 {
-  "pause_mode": "both",
+  "pause_mode": "all",
   "should_pause": true,
   "heartbeat_timeout": 180.0,
   "flags": {
@@ -331,12 +331,12 @@ curl -X POST http://<pausarr-host>:8080/heartbeat \
 
 - **No auth.** Pausarr is intended for a trusted LAN. Anything that can reach it
   can pause your torrents. Don't expose it to the internet.
-- **Pause acts on all torrents.** Pausarr always targets *all* torrents
-  (`hashes=all`). In `both` mode it stops/starts them and does not track which
-  it paused, so a resume also starts torrents you stopped manually. In
-  `upload`/`download` mode it instead throttles that direction's rate limit,
-  first snapshotting and later restoring each torrent's original per-torrent
-  limit so manual limits are preserved. See [Pause modes](#pause-modes).
+- **Pause is global.** In `all` mode Pausarr stops/starts *all* torrents
+  (`hashes=all`) and does not track which it paused, so a resume also starts
+  torrents you stopped manually. In `keep-seeding` mode it instead sets the
+  global `max_active_downloads` to 0 (snapshotting and later restoring your
+  original queue settings), stopping downloads while completed torrents keep
+  seeding. See [Pause modes](#pause-modes).
 - **Push flags never auto-expire.** If a source sends `pause` and its `resume`
   is lost, that flag stays set. This is intentional (a missed resume shouldn't
   silently un-pause mid-movie); clear it manually via `/status` inspection and a

@@ -19,7 +19,7 @@ import asyncio
 import logging
 from typing import Optional
 
-from .config import PAUSE_MODE_BOTH
+from .config import PAUSE_MODE_ALL, PAUSE_MODE_KEEP_SEEDING
 from .qbittorrent import QBittorrentClient, QBittorrentError
 from .state import StateStore
 
@@ -32,14 +32,15 @@ class Reconciler:
         store: StateStore,
         qbt: QBittorrentClient,
         poll_interval: float,
-        pause_mode: str = PAUSE_MODE_BOTH,
+        pause_mode: str = PAUSE_MODE_ALL,
     ) -> None:
         self._store = store
         self._qbt = qbt
         self._poll_interval = poll_interval
-        # "both" | "upload" | "download". In "both" we stop/start torrents; in
-        # the directional modes we snapshot and throttle that direction's rate
-        # limit instead. See _apply_pause / _apply_resume.
+        # "all" | "keep-seeding". In "all" we stop/start every torrent; in
+        # "keep-seeding" we set the global download-queue limit to 0 so
+        # downloads stop but completed torrents keep seeding. See _apply_pause /
+        # _apply_resume.
         self._pause_mode = pause_mode
         # None = unknown (force a reconcile on first run so we converge the
         # actual qBittorrent state to what Pausarr believes).
@@ -67,39 +68,40 @@ class Reconciler:
     async def _apply_pause(self) -> None:
         """Pause according to the configured mode.
 
-        * ``both``     — stop all torrents.
-        * ``upload`` / ``download`` — snapshot each torrent's current
-          per-torrent limit for that direction, persist it, then throttle the
-          direction to the minimum. The snapshot is taken *before* throttling
-          so we capture the user's real limits, and only when one isn't already
-          cached (a re-pause while already paused must not overwrite the
-          originals with our throttle value).
+        * ``all``          — stop every torrent.
+        * ``keep-seeding`` — snapshot the global download-queue preferences,
+          persist them, then set ``max_active_downloads`` to 0 so downloads
+          stop while completed torrents keep seeding. The snapshot is taken
+          *before* changing anything and only when one isn't already cached (a
+          re-pause while already paused must not overwrite the originals with
+          our zeroed value).
         """
-        if self._pause_mode == PAUSE_MODE_BOTH:
+        if self._pause_mode == PAUSE_MODE_ALL:
             await self._qbt.pause_all()
             return
-        direction = self._pause_mode
-        if not self._store.has_cached_limits(direction):
-            limits = await self._qbt.fetch_limits()
-            self._store.save_cached_limits(direction, limits[direction])
-        await self._qbt.throttle_all(direction)
+        # keep-seeding
+        if self._store.has_cached_prefs():
+            # Already paused; the queue limit is already 0, nothing to do.
+            return
+        original = await self._qbt.stop_downloads()
+        self._store.save_cached_prefs(original)
 
     async def _apply_resume(self) -> None:
         """Resume according to the configured mode (inverse of _apply_pause)."""
-        if self._pause_mode == PAUSE_MODE_BOTH:
+        if self._pause_mode == PAUSE_MODE_ALL:
             await self._qbt.resume_all()
             return
-        direction = self._pause_mode
-        limits = self._store.take_cached_limits(direction)
-        if limits:
-            await self._qbt.restore_limits(direction, limits)
+        # keep-seeding
+        prefs = self._store.take_cached_prefs()
+        if prefs:
+            await self._qbt.restore_downloads(prefs)
         else:
-            # No snapshot (e.g. first run, or state lost): fall back to
-            # unlimited so we don't leave torrents stuck at the throttle floor.
-            await self._qbt.restore_limits(direction, {})
+            # No snapshot (e.g. first run, or state lost). We don't know the
+            # original max_active_downloads, so leave qBittorrent's current
+            # settings untouched rather than guessing a value.
             logger.info(
-                "No cached %s limits to restore; leaving current limits as-is",
-                direction,
+                "No cached download-queue prefs to restore; leaving qBittorrent "
+                "settings as-is (set max_active_downloads manually if needed)"
             )
 
     async def _run(self) -> None:
