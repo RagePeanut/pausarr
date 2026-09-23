@@ -25,6 +25,24 @@ def _get_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _get_positive_int(name: str, default: int) -> int:
+    """Read a positive integer env var, falling back to default on unset/empty.
+
+    Raises on a set-but-non-integer or non-positive value so a misconfiguration
+    surfaces at startup.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ValueError(f"{name}={raw!r} is invalid; expected a positive integer")
+    if value <= 0:
+        raise ValueError(f"{name}={raw!r} is invalid; expected a positive integer")
+    return value
+
+
 def _get_pause_mode(name: str, default: str) -> str:
     """Read and validate PAUSE_MODE, falling back to the default on unset.
 
@@ -76,6 +94,18 @@ class Config:
     #                    them on resume so it never clobbers your settings.
     pause_mode: str
 
+    # Crash-recovery fallback for "keep-seeding" mode.
+    #
+    # Normally Pausarr snapshots your real ``max_active_downloads`` before
+    # zeroing it, and restores that on resume. But if it reads a value of 0 —
+    # which means qBittorrent is *already* stopped (e.g. Pausarr crashed while
+    # paused and the snapshot was lost) — caching 0 would mean downloads never
+    # resume. In that case Pausarr restores this value instead. Defaults to
+    # 100000 (qBittorrent's own "effectively unlimited" sentinel); set it to
+    # match your normal ``max_active_downloads`` so crash-recovery restores the
+    # right number.
+    keep_seeding_max_active_downloads: int
+
     # Where the flag state is persisted so it survives restarts.
     state_file: str
 
@@ -93,6 +123,9 @@ class Config:
             heartbeat_timeout=float(os.getenv("HEARTBEAT_TIMEOUT", "180")),
             poll_interval=float(os.getenv("POLL_INTERVAL", "15")),
             pause_mode=_get_pause_mode("PAUSE_MODE", PAUSE_MODE_ALL),
+            keep_seeding_max_active_downloads=_get_positive_int(
+                "KEEP_SEEDING_MAX_ACTIVE_DOWNLOADS", 100000
+            ),
             state_file=os.getenv("STATE_FILE", "/data/state.json"),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )

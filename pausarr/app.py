@@ -77,7 +77,13 @@ def create_app(config: Config | None = None) -> FastAPI:
     qbt = QBittorrentClient(
         config.qbittorrent_url, config.qbittorrent_user, config.qbittorrent_pass
     )
-    reconciler = Reconciler(store, qbt, config.poll_interval, config.pause_mode)
+    reconciler = Reconciler(
+        store,
+        qbt,
+        config.poll_interval,
+        config.pause_mode,
+        config.keep_seeding_max_active_downloads,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

@@ -170,6 +170,7 @@ All configuration is via environment variables (see `.env.example`).
 | `HEARTBEAT_TIMEOUT` | `180` | Seconds without a ping before a heartbeat flag expires (**global**) |
 | `POLL_INTERVAL` | `15` | Seconds between watchdog runs (expiry + reconcile) |
 | `PAUSE_MODE` | `all` | What a pause does: `all` or `keep-seeding` — see [Pause modes](#pause-modes) |
+| `KEEP_SEEDING_MAX_ACTIVE_DOWNLOADS` | `100000` | Crash-recovery fallback for `keep-seeding` (see [Pause modes](#pause-modes)). Set to your normal qBittorrent `max_active_downloads` |
 | `STATE_FILE` | `/data/state.json` | Where flag state is persisted |
 | `LOG_LEVEL` | `INFO` | Python log level |
 
@@ -211,9 +212,15 @@ torrents continue *seeding*. On resume it restores your original values.
 >   (that's just how BitTorrent works); **completed** torrents seed normally.
 > - Requires qBittorrent **torrent queueing**; Pausarr enables it automatically
 >   while paused and restores your original setting on resume.
-> - If Pausarr's state file is lost while paused, it can't know your original
->   `max_active_downloads`; it then leaves qBittorrent's current settings
->   untouched rather than guessing. Keep `STATE_FILE` on a persistent volume.
+> - **Crash recovery.** Pausarr persists your original `max_active_downloads`
+>   to the state file *before* it zeroes qBittorrent, so a crash mid-pause can
+>   still restore it. If that snapshot is ever lost *and* qBittorrent already
+>   reads `max_active_downloads: 0` (downloads already stopped), the real value
+>   is unknown — caching 0 would mean downloads never resume. So Pausarr
+>   restores `KEEP_SEEDING_MAX_ACTIVE_DOWNLOADS` (default `100000`, effectively
+>   unlimited) instead. Set it to your normal `max_active_downloads` so
+>   recovery restores the right number. Keep `STATE_FILE` on a persistent
+>   volume so this fallback is rarely needed.
 
 ---
 
