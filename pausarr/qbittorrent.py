@@ -152,36 +152,37 @@ class QBittorrentClient:
                 f"(status {resp.status_code}): {resp.text!r}"
             )
 
-    async def stop_downloads(self) -> dict:
+    async def read_download_prefs(self) -> dict:
+        """Read the download-queue preferences relevant to keep-seeding mode.
+
+        Returns ``{"max_active_downloads": int, "queueing_enabled": bool}``.
+
+        Kept separate from :meth:`set_downloads_stopped` so the caller can
+        persist this snapshot *before* mutating qBittorrent — a write-ahead
+        order that stays crash-safe: a crash after reading but before changing
+        anything leaves qBittorrent untouched.
+        """
+        prefs = await self.get_preferences()
+        return {
+            "max_active_downloads": int(prefs.get("max_active_downloads", 0)),
+            "queueing_enabled": bool(prefs.get("queueing_enabled", False)),
+        }
+
+    async def set_downloads_stopped(self) -> None:
         """Stop new/active downloads while letting completed torrents seed.
 
         Sets the global ``max_active_downloads`` to 0, which — with torrent
         queueing enabled — pauses the *downloading* phase but leaves seeding
         untouched. Queueing is enabled if it wasn't already (otherwise the
         limit is ignored).
-
-        Returns the original values ``{"max_active_downloads": int,
-        "queueing_enabled": bool}`` so the caller can cache and later restore
-        them.
         """
-        prefs = await self.get_preferences()
-        original = {
-            "max_active_downloads": int(prefs.get("max_active_downloads", 0)),
-            "queueing_enabled": bool(prefs.get("queueing_enabled", False)),
-        }
         await self._set_preferences(
             {"queueing_enabled": True, "max_active_downloads": 0}
         )
-        logger.info(
-            "Stopped downloads (max_active_downloads=0; queueing on); "
-            "was max_active_downloads=%s, queueing_enabled=%s",
-            original["max_active_downloads"],
-            original["queueing_enabled"],
-        )
-        return original
+        logger.info("Stopped downloads (max_active_downloads=0; queueing on)")
 
     async def restore_downloads(self, original: dict) -> None:
-        """Restore the download-queue preferences captured by stop_downloads."""
+        """Restore the download-queue preferences captured by read_download_prefs."""
         prefs = {
             "queueing_enabled": bool(original.get("queueing_enabled", True)),
             "max_active_downloads": int(original.get("max_active_downloads", 0)),

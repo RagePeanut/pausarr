@@ -33,6 +33,7 @@ class Reconciler:
         qbt: QBittorrentClient,
         poll_interval: float,
         pause_mode: str = PAUSE_MODE_ALL,
+        keep_seeding_max_active_downloads: int = 100000,
     ) -> None:
         self._store = store
         self._qbt = qbt
@@ -42,6 +43,10 @@ class Reconciler:
         # downloads stop but completed torrents keep seeding. See _apply_pause /
         # _apply_resume.
         self._pause_mode = pause_mode
+        # Crash-recovery fallback: what to cache/restore if we read a
+        # max_active_downloads of 0 (meaning downloads are already stopped, so
+        # the real value is unknown). See _apply_pause.
+        self._keep_seeding_max_active_downloads = keep_seeding_max_active_downloads
         # None = unknown (force a reconcile on first run so we converge the
         # actual qBittorrent state to what Pausarr believes).
         self._last_applied_pause: Optional[bool] = None
@@ -71,10 +76,19 @@ class Reconciler:
         * ``all``          — stop every torrent.
         * ``keep-seeding`` — snapshot the global download-queue preferences,
           persist them, then set ``max_active_downloads`` to 0 so downloads
-          stop while completed torrents keep seeding. The snapshot is taken
-          *before* changing anything and only when one isn't already cached (a
-          re-pause while already paused must not overwrite the originals with
-          our zeroed value).
+          stop while completed torrents keep seeding.
+
+        Crash safety. The snapshot is only taken when one isn't already cached
+        (a re-pause while already paused must not overwrite the originals with
+        our zeroed value), and it is persisted to disk *before* qBittorrent is
+        mutated (write-ahead), so a crash between the two can never leave
+        qBittorrent stopped with no cached original to restore.
+
+        Sentinel guard. If we read a ``max_active_downloads`` of 0, downloads
+        are *already* stopped — most likely we crashed while paused and lost the
+        cache. The true original is unknown, and caching 0 would mean downloads
+        never resume. So we substitute the configured fallback
+        (``KEEP_SEEDING_MAX_ACTIVE_DOWNLOADS``) instead.
         """
         if self._pause_mode == PAUSE_MODE_ALL:
             await self._qbt.pause_all()
@@ -83,8 +97,20 @@ class Reconciler:
         if self._store.has_cached_prefs():
             # Already paused; the queue limit is already 0, nothing to do.
             return
-        original = await self._qbt.stop_downloads()
+        original = await self._qbt.read_download_prefs()
+        if original["max_active_downloads"] <= 0:
+            logger.warning(
+                "Read max_active_downloads=%s (downloads already stopped); the "
+                "real value is unknown, using fallback %s "
+                "(KEEP_SEEDING_MAX_ACTIVE_DOWNLOADS)",
+                original["max_active_downloads"],
+                self._keep_seeding_max_active_downloads,
+            )
+            original["max_active_downloads"] = self._keep_seeding_max_active_downloads
+        # Persist BEFORE mutating qBittorrent (write-ahead) so a crash between
+        # the two still leaves us with the original cached for restore.
         self._store.save_cached_prefs(original)
+        await self._qbt.set_downloads_stopped()
 
     async def _apply_resume(self) -> None:
         """Resume according to the configured mode (inverse of _apply_pause)."""
