@@ -5,8 +5,8 @@ Pause your torrents while you're actually watching something — from **any** so
 Pausarr is a tiny always-on service that sits between your media sources and
 qBittorrent. Each source raises a flag when it wants torrenting paused; Pausarr
 **pauses torrents while any flag is active and resumes them once every flag
-is clear.** By default it stops torrents outright, but it can instead stop only
-*downloading* while completed torrents keep *seeding* (see
+is clear.** It can either stop torrents outright or stop only *downloading*
+while completed torrents keep *seeding* — chosen globally or per caller (see
 [Pause modes](#pause-modes)). It replaces a
 single-purpose Tautulli→qBittorrent script with a
 general hub that also handles YouTube/Twitch on a TV, apps on your phone, or
@@ -169,7 +169,7 @@ All configuration is via environment variables (see `.env.example`).
 | `QBITTORRENT_PASS` | _(empty)_ | Web UI password — **optional**, see note below |
 | `HEARTBEAT_TIMEOUT` | `180` | Seconds without a ping before a heartbeat flag expires (**global**) |
 | `POLL_INTERVAL` | `15` | Seconds between watchdog runs (expiry + reconcile) |
-| `PAUSE_MODE` | `all` | What a pause does: `all` or `keep-seeding` — see [Pause modes](#pause-modes) |
+| `PAUSE_MODE` | _(unset)_ | Fixed pause mode for **every** pause: `all` or `keep-seeding`. Leave unset to let each caller choose per request — see [Pause modes](#pause-modes) |
 | `KEEP_SEEDING_MAX_ACTIVE_DOWNLOADS` | `100000` | Crash-recovery fallback for `keep-seeding` (see [Pause modes](#pause-modes)). Set to your normal qBittorrent `max_active_downloads` |
 | `STATE_FILE` | `/data/state.json` | Where flag state is persisted |
 | `LOG_LEVEL` | `INFO` | Python log level |
@@ -188,13 +188,38 @@ All configuration is via environment variables (see `.env.example`).
 
 ### Pause modes
 
-`PAUSE_MODE` controls **what** a pause does. The flag logic is identical in both
-modes — only the action taken against qBittorrent changes.
+A **pause mode** controls **what** a pause does. The flag logic is identical in
+both modes — only the action taken against qBittorrent changes.
 
 | Mode | While a flag is active | Effect |
 |------|------------------------|--------|
-| `all` *(default)* | Stops **all** torrents (`hashes=all`) | Downloading *and* seeding halt — the classic behaviour |
+| `all` | Stops **all** torrents (`hashes=all`) | Downloading *and* seeding halt — the classic behaviour |
 | `keep-seeding` | Sets qBittorrent's global `max_active_downloads` to **0** | New/active **downloads** stop; **completed torrents keep seeding** at full speed |
+
+#### Choosing the mode: global vs. per-caller
+
+There are **two ways** to set the pause mode, and there is **no default**:
+
+1. **Global (`PAUSE_MODE` env var).** Set it to `all` or `keep-seeding` and
+   that single mode is used for **every** pause. It **overrides** any
+   `pause_mode` sent in a request — callers needn't send one, and if they do
+   it's ignored.
+2. **Per-caller (request body).** Leave `PAUSE_MODE` unset and each caller
+   supplies its own `pause_mode` in the `POST /pause` / `POST /heartbeat` body.
+   This lets different sources want different things — e.g. Plex asks for `all`
+   while a background source asks for `keep-seeding`.
+
+**When several active flags disagree, the most restrictive mode wins:** `all`
+(stops downloading *and* seeding) beats `keep-seeding` (stops downloading only).
+So if one active caller asked for `all` and another for `keep-seeding`, torrents
+are fully stopped until the `all` caller clears — then Pausarr automatically
+steps down to `keep-seeding` while that flag remains, and resumes fully once all
+flags clear. Pausarr handles these transitions live (it undoes the previous
+mode's effect before applying the new one).
+
+**No mode, no pause.** If `PAUSE_MODE` is unset **and** a `pause`/`heartbeat`
+request arrives without a `pause_mode`, Pausarr can't know how to pause, so it
+rejects the request with **HTTP 400** rather than guessing.
 
 **How `keep-seeding` works.** qBittorrent can't "pause downloads" per torrent
 without also killing seeding — throttling the download rate drags upload down
@@ -229,31 +254,45 @@ torrents continue *seeding*. On resume it restores your original values.
 ### `POST /pause` — push sources
 
 ```json
-{ "tag": "plex", "request": "pause" }
+{ "tag": "plex", "request": "pause", "pause_mode": "all" }
 ```
 
-`request` is `pause` or `resume`. Returns the current status snapshot.
+`request` is `pause` or `resume`. `pause_mode` (`all` or `keep-seeding`) is
+**required only when no global `PAUSE_MODE` is set**, and only matters for a
+`pause` request (it's ignored on `resume`); when a global `PAUSE_MODE` is set it
+may be omitted (and is ignored). Returns the current status snapshot. See
+[Pause modes](#pause-modes).
 
 ### `POST /heartbeat` — heartbeat sources
 
 ```json
-{ "tag": "youtube-tv" }
+{ "tag": "youtube-tv", "pause_mode": "keep-seeding" }
 ```
 
-Call this on an interval (e.g. every 60 s) while the source is active. Returns
-the current status snapshot.
+Call this on an interval (e.g. every 60 s) while the source is active. As with
+`/pause`, `pause_mode` is required only when no global `PAUSE_MODE` is set, and
+ignored when one is. Returns the current status snapshot.
+
+> **Missing mode → 400.** If no global `PAUSE_MODE` is configured and a request
+> omits `pause_mode`, Pausarr responds `400 Bad Request`. An unknown value
+> (anything other than `all`/`keep-seeding`) is a `422`.
 
 ### `GET /status` — debugging
 
+`pause_mode` here is the **global** setting (`null` when unset, meaning modes
+come per-request). Each flag also reports the `pause_mode` it last requested.
+
 ```json
 {
-  "pause_mode": "all",
+  "pause_mode": null,
   "should_pause": true,
   "heartbeat_timeout": 180.0,
   "flags": {
-    "plex":       { "kind": "push",      "active": false, "updated_at": 1700000000.0 },
+    "plex":       { "kind": "push",      "active": false, "updated_at": 1700000000.0,
+                    "pause_mode": null },
     "youtube-tv": { "kind": "heartbeat", "active": true,  "last_seen": 1700000100.0,
-                    "seconds_since_last_seen": 12.4, "expires_in": 167.6 }
+                    "seconds_since_last_seen": 12.4, "expires_in": 167.6,
+                    "pause_mode": "keep-seeding" }
   }
 }
 ```
@@ -265,6 +304,12 @@ Liveness probe → `{"status": "ok"}`.
 ---
 
 ## Source setup recipes
+
+> **Do you need to add `pause_mode`?** The bodies below omit it, which is
+> correct when you've set a global `PAUSE_MODE`. If you left `PAUSE_MODE` unset,
+> add a `"pause_mode"` field (`"all"` or `"keep-seeding"`) to each `pause`/
+> `heartbeat` body — otherwise the request is rejected with `400`. See
+> [Pause modes](#pause-modes).
 
 ### 1. Tautulli / Plex (push)
 
@@ -370,6 +415,12 @@ curl -X POST http://<pausarr-host>:8080/heartbeat \
   global `max_active_downloads` to 0 (snapshotting and later restoring your
   original queue settings), stopping downloads while completed torrents keep
   seeding. See [Pause modes](#pause-modes).
+- **Mode is global too, even when chosen per-caller.** A per-request
+  `pause_mode` selects *which* global action runs, not a per-torrent scope.
+  With several active callers the most restrictive mode applies to everything
+  until that caller clears; there's no way to pause one caller's torrents in
+  `all` and another's in `keep-seeding` simultaneously — qBittorrent's controls
+  are global.
 - **Push flags never auto-expire.** If a source sends `pause` and its `resume`
   is lost, that flag stays set. This is intentional (a missed resume shouldn't
   silently un-pause mid-movie); clear it manually via `/status` inspection and a

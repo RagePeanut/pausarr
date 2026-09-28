@@ -29,6 +29,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .config import most_restrictive_pause_mode
+
 logger = logging.getLogger(__name__)
 
 PUSH = "push"
@@ -46,6 +48,11 @@ class Flag:
     last_seen: float = 0.0
     # Wall-clock time this flag was last changed, for observability.
     updated_at: float = field(default_factory=time.time)
+    # The pause mode this source requested ("all" | "keep-seeding"), or None
+    # when the source didn't specify one (only valid when a global PAUSE_MODE
+    # is configured, which overrides this anyway). Used to compute the
+    # effective mode across active flags — see StateStore.effective_pause_mode.
+    pause_mode: Optional[str] = None
 
     def is_active(self, now: float, heartbeat_timeout: float) -> bool:
         if self.kind == HEARTBEAT:
@@ -86,6 +93,7 @@ class StateStore:
                     active=data.get("active", False),
                     last_seen=data.get("last_seen", 0.0),
                     updated_at=data.get("updated_at", time.time()),
+                    pause_mode=data.get("pause_mode"),
                 )
             self._cached_prefs = self._sanitize_cached_prefs(
                 raw.get("cached_prefs", {})
@@ -126,6 +134,7 @@ class StateStore:
                     "active": f.active,
                     "last_seen": f.last_seen,
                     "updated_at": f.updated_at,
+                    "pause_mode": f.pause_mode,
                 }
                 for tag, f in self._flags.items()
             },
@@ -149,20 +158,30 @@ class StateStore:
     # ------------------------------------------------------------------ #
     # Mutations
     # ------------------------------------------------------------------ #
-    def set_push(self, tag: str, active: bool) -> None:
-        """Set an explicit push flag (pause=True / resume=False)."""
+    def set_push(self, tag: str, active: bool, pause_mode: Optional[str] = None) -> None:
+        """Set an explicit push flag (pause=True / resume=False).
+
+        ``pause_mode`` is the mode this source requested; it's recorded on
+        pause so :meth:`effective_pause_mode` can factor it in. On resume the
+        mode is meaningless, so we clear it to avoid a stale value lingering.
+        """
         with self._lock:
             flag = self._flags.get(tag)
             if flag is None or flag.kind != PUSH:
                 flag = Flag(tag=tag, kind=PUSH)
                 self._flags[tag] = flag
             flag.active = active
+            flag.pause_mode = pause_mode if active else None
             flag.updated_at = time.time()
             self._persist_locked()
             logger.info("Push flag %r set to %s", tag, "pause" if active else "resume")
 
-    def heartbeat(self, tag: str) -> None:
-        """Record a heartbeat, (re)creating the flag and refreshing its TTL."""
+    def heartbeat(self, tag: str, pause_mode: Optional[str] = None) -> None:
+        """Record a heartbeat, (re)creating the flag and refreshing its TTL.
+
+        ``pause_mode`` is the mode this source requested; the latest heartbeat's
+        value is kept so :meth:`effective_pause_mode` can factor it in.
+        """
         now = time.time()
         with self._lock:
             flag = self._flags.get(tag)
@@ -171,6 +190,7 @@ class StateStore:
                 self._flags[tag] = flag
                 logger.info("Heartbeat flag %r created", tag)
             flag.last_seen = now
+            flag.pause_mode = pause_mode
             flag.updated_at = now
             self._persist_locked()
 
@@ -236,6 +256,30 @@ class StateStore:
                 f.is_active(now, self._heartbeat_timeout) for f in self._flags.values()
             )
 
+    def effective_pause_mode(self, now: Optional[float] = None) -> Optional[str]:
+        """Most restrictive pause mode requested by the active flags.
+
+        Only flags that are currently active *and* carry a ``pause_mode`` are
+        considered; "all" wins over "keep-seeding" (see
+        :func:`most_restrictive_pause_mode`). Returns None when no active flag
+        specified a mode — meaning the caller (the reconciler) must fall back to
+        a globally-configured mode, or treat the absence as a misconfiguration.
+
+        This is only consulted when there is no fixed global ``PAUSE_MODE``; a
+        configured global mode overrides per-flag modes entirely.
+        """
+        now = now if now is not None else time.time()
+        with self._lock:
+            modes = [
+                f.pause_mode
+                for f in self._flags.values()
+                if f.pause_mode is not None
+                and f.is_active(now, self._heartbeat_timeout)
+            ]
+        if not modes:
+            return None
+        return most_restrictive_pause_mode(modes)
+
     def snapshot(self, now: Optional[float] = None) -> dict:
         """A serialisable view of current state for the /status endpoint."""
         now = now if now is not None else time.time()
@@ -246,6 +290,7 @@ class StateStore:
                     "kind": f.kind,
                     "active": f.is_active(now, self._heartbeat_timeout),
                     "updated_at": f.updated_at,
+                    "pause_mode": f.pause_mode,
                 }
                 if f.kind == HEARTBEAT:
                     entry["last_seen"] = f.last_seen

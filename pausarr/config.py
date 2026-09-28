@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 # Valid values for PAUSE_MODE. See Config.pause_mode.
 #
@@ -16,6 +17,39 @@ from dataclasses import dataclass
 PAUSE_MODE_ALL = "all"
 PAUSE_MODE_KEEP_SEEDING = "keep-seeding"
 _VALID_PAUSE_MODES = {PAUSE_MODE_ALL, PAUSE_MODE_KEEP_SEEDING}
+
+# Restrictiveness ranking, most restrictive last. When several active flags ask
+# for different pause modes, the most restrictive one wins: "all" stops
+# everything (downloading *and* seeding), whereas "keep-seeding" only stops
+# downloading. So "all" dominates "keep-seeding".
+_PAUSE_MODE_RESTRICTIVENESS = {
+    PAUSE_MODE_KEEP_SEEDING: 0,
+    PAUSE_MODE_ALL: 1,
+}
+
+
+def validate_pause_mode(value: str) -> str:
+    """Normalise and validate a pause-mode string, raising on an invalid one.
+
+    Shared by the env-var loader and the request handlers so both accept
+    exactly the same set of values (case-insensitively).
+    """
+    normalised = value.strip().lower()
+    if normalised not in _VALID_PAUSE_MODES:
+        raise ValueError(
+            f"{value!r} is invalid; expected one of "
+            f"{', '.join(sorted(_VALID_PAUSE_MODES))}"
+        )
+    return normalised
+
+
+def most_restrictive_pause_mode(modes) -> str:
+    """Return the most restrictive mode from a non-empty iterable of modes.
+
+    "all" beats "keep-seeding" because it halts more (seeding as well as
+    downloading). Callers must pass at least one already-validated mode.
+    """
+    return max(modes, key=lambda m: _PAUSE_MODE_RESTRICTIVENESS[m])
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -43,8 +77,13 @@ def _get_positive_int(name: str, default: int) -> int:
     return value
 
 
-def _get_pause_mode(name: str, default: str) -> str:
-    """Read and validate PAUSE_MODE, falling back to the default on unset.
+def _get_optional_pause_mode(name: str) -> Optional[str]:
+    """Read and validate PAUSE_MODE, returning None when it is unset.
+
+    When set, it becomes the single fixed mode used for *every* pause,
+    overriding any per-request ``pause_mode``. When unset (None), there is no
+    default: each caller must supply its own ``pause_mode`` and the most
+    restrictive one among active flags is applied.
 
     An explicitly-set but invalid value is a configuration error and raises so
     the misconfiguration surfaces at startup rather than silently pausing the
@@ -52,14 +91,11 @@ def _get_pause_mode(name: str, default: str) -> str:
     """
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
-        return default
-    value = raw.strip().lower()
-    if value not in _VALID_PAUSE_MODES:
-        raise ValueError(
-            f"{name}={raw!r} is invalid; expected one of "
-            f"{', '.join(sorted(_VALID_PAUSE_MODES))}"
-        )
-    return value
+        return None
+    try:
+        return validate_pause_mode(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name}={raw!r} {exc}")
 
 
 @dataclass(frozen=True)
@@ -83,7 +119,7 @@ class Config:
     # How often the watchdog re-evaluates state and expires stale heartbeats.
     poll_interval: float
 
-    # What a pause does. One of "all" (default) or "keep-seeding".
+    # What a pause does. One of "all", "keep-seeding", or None.
     #
     # * "all"          — fully stop/start every torrent (hashes=all). The
     #                    historical behaviour: downloading and seeding both halt.
@@ -92,7 +128,13 @@ class Config:
     #                    ``max_active_downloads`` to 0 (and enables queueing if
     #                    needed), snapshotting the originals first and restoring
     #                    them on resume so it never clobbers your settings.
-    pause_mode: str
+    # * None           — PAUSE_MODE was left unset. There is no default mode;
+    #                    each caller must supply a ``pause_mode`` in its request
+    #                    body, and the most restrictive mode among active flags
+    #                    is applied. A pause request with no resolvable mode is
+    #                    rejected. When set to a concrete value it is fixed and
+    #                    overrides any per-request ``pause_mode``.
+    pause_mode: Optional[str]
 
     # Crash-recovery fallback for "keep-seeding" mode.
     #
@@ -122,7 +164,7 @@ class Config:
             qbittorrent_pass=os.getenv("QBITTORRENT_PASS", ""),
             heartbeat_timeout=float(os.getenv("HEARTBEAT_TIMEOUT", "180")),
             poll_interval=float(os.getenv("POLL_INTERVAL", "15")),
-            pause_mode=_get_pause_mode("PAUSE_MODE", PAUSE_MODE_ALL),
+            pause_mode=_get_optional_pause_mode("PAUSE_MODE"),
             keep_seeding_max_active_downloads=_get_positive_int(
                 "KEEP_SEEDING_MAX_ACTIVE_DOWNLOADS", 100000
             ),
