@@ -14,10 +14,10 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, field_validator
 
-from .config import Config
+from .config import Config, validate_pause_mode
 from .qbittorrent import QBittorrentClient
 from .reconciler import Reconciler
 from .state import StateStore
@@ -52,15 +52,57 @@ def _install_healthz_log_filter() -> None:
         access_logger.addFilter(_HealthzAccessLogFilter())
 
 
+def _normalise_pause_mode(value: str | None) -> str | None:
+    """Validate an optional request-body pause mode, returning None if absent.
+
+    A malformed value (e.g. "loud") is rejected as a 422 by pydantic; the
+    "missing when required" case is handled per-request against the config so
+    the error message can explain the global-vs-per-request rule.
+    """
+    if value is None:
+        return None
+    try:
+        return validate_pause_mode(value)
+    except ValueError as exc:
+        raise ValueError(str(exc))
+
+
 class PauseRequest(BaseModel):
     tag: str = Field(..., min_length=1, description="Source identifier, e.g. 'plex'")
     request: Literal["pause", "resume"] = Field(
         ..., description="Whether this source wants torrents paused or resumed"
     )
+    pause_mode: str | None = Field(
+        None,
+        description=(
+            "Pause mode for this source ('all' or 'keep-seeding'). Required "
+            "when the server has no global PAUSE_MODE configured; ignored when "
+            "it does (the global mode always wins). Only relevant for a "
+            "'pause' request."
+        ),
+    )
+
+    @field_validator("pause_mode")
+    @classmethod
+    def _check_pause_mode(cls, v: str | None) -> str | None:
+        return _normalise_pause_mode(v)
 
 
 class HeartbeatRequest(BaseModel):
     tag: str = Field(..., min_length=1, description="Source identifier, e.g. 'youtube-tv'")
+    pause_mode: str | None = Field(
+        None,
+        description=(
+            "Pause mode for this source ('all' or 'keep-seeding'). Required "
+            "when the server has no global PAUSE_MODE configured; ignored when "
+            "it does (the global mode always wins)."
+        ),
+    )
+
+    @field_validator("pause_mode")
+    @classmethod
+    def _check_pause_mode(cls, v: str | None) -> str | None:
+        return _normalise_pause_mode(v)
 
 
 def create_app(config: Config | None = None) -> FastAPI:
@@ -92,7 +134,12 @@ def create_app(config: Config | None = None) -> FastAPI:
         store.expire_stale()
         await reconciler.reconcile()
         reconciler.start()
-        logger.info("Pausarr started (pause mode: %s)", config.pause_mode)
+        logger.info(
+            "Pausarr started (pause mode: %s)",
+            config.pause_mode
+            if config.pause_mode is not None
+            else "per-request (no global PAUSE_MODE set)",
+        )
         try:
             yield
         finally:
@@ -106,15 +153,40 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.state.reconciler = reconciler
     app.state.config = config
 
+    def _resolve_request_pause_mode(requested: str | None) -> str | None:
+        """Decide which pause mode to store for an incoming pause/heartbeat.
+
+        * A global ``PAUSE_MODE`` overrides everything — the request's mode is
+          ignored (we store None; the reconciler uses the global mode).
+        * Otherwise the request must supply a mode, else it's a 400: with no
+          global default there's no way to know how to pause.
+        """
+        if config.pause_mode is not None:
+            return None
+        if requested is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "pause_mode is required: the server has no global "
+                    "PAUSE_MODE configured, so each request must specify "
+                    "'pause_mode' ('all' or 'keep-seeding')."
+                ),
+            )
+        return requested
+
     @app.post("/pause")
     async def pause(req: PauseRequest):
-        store.set_push(req.tag, active=(req.request == "pause"))
+        pausing = req.request == "pause"
+        # Only a 'pause' needs a mode; a 'resume' clears the flag regardless.
+        mode = _resolve_request_pause_mode(req.pause_mode) if pausing else None
+        store.set_push(req.tag, active=pausing, pause_mode=mode)
         await reconciler.reconcile()
         return store.snapshot()
 
     @app.post("/heartbeat")
     async def heartbeat(req: HeartbeatRequest):
-        store.heartbeat(req.tag)
+        mode = _resolve_request_pause_mode(req.pause_mode)
+        store.heartbeat(req.tag, pause_mode=mode)
         await reconciler.reconcile()
         return store.snapshot()
 
